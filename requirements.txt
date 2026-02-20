@@ -1,0 +1,16 @@
+# Speaker Diarization System - Phase 1
+#
+# IMPORTANT: Install PyTorch (CPU-only) BEFORE running this file:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+#
+# Then install remaining deps:
+#   pip install -r requirements.txt
+#
+# Or just run: install.bat
+
+pyannote.audio>=3.3.0
+faster-whisper>=1.0.0
+python-dotenv>=1.0.0
+soundfile>=0.12.0
+scipy>=1.11.0
+numpy>=1.24.0
