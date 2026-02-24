@@ -13,6 +13,12 @@ import os
 import sys
 import json
 import time
+import warnings
+
+# Suppress noisy-but-harmless warnings from pyannote / huggingface_hub
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
+warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 import argparse
 from math import gcd
 from pathlib import Path
@@ -58,13 +64,15 @@ def extract_segment_16k(audio: np.ndarray, sr: int, start: float, end: float) ->
 # ---------------------------------------------------------------------------
 
 def run_diarization(
-    audio_path: str,
+    audio: np.ndarray,
+    sr: int,
     hf_token: str,
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
 ) -> list[tuple[float, float, str]]:
     """
     Run pyannote/speaker-diarization-3.1.
+    Accepts preloaded audio (numpy array) to avoid torchcodec/FFmpeg dependency.
     Returns list of (start_sec, end_sec, speaker_id).
     """
     import torch
@@ -73,7 +81,7 @@ def run_diarization(
     print("[2/4] Loading pyannote diarization pipeline...")
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token,
+        token=hf_token,
     )
     pipeline.to(torch.device("cpu"))
 
@@ -83,12 +91,33 @@ def run_diarization(
     if max_speakers is not None:
         params["max_speakers"] = max_speakers
 
-    print("      Running diarization (slowest step on CPU)...")
-    diarization = pipeline(str(audio_path), **params)
+    # Pass preloaded waveform to avoid torchcodec/FFmpeg requirement
+    waveform = torch.from_numpy(audio).unsqueeze(0)  # (1, samples)
+    audio_input = {"waveform": waveform, "sample_rate": sr}
 
+    print("      Running diarization (slowest step on CPU)...")
+    diarization = pipeline(audio_input, **params)
+
+    # pyannote >= 3.3 returns DiarizeOutput; extract the Annotation object
+    annotation = None
+    for candidate in [
+        diarization,
+        getattr(diarization, "speaker_diarization", None),
+        getattr(diarization, "exclusive_speaker_diarization", None),
+        getattr(diarization, "annotation", None),
+    ]:
+        if candidate is not None and hasattr(candidate, "itertracks"):
+            annotation = candidate
+            break
+    else:
+        attrs = [a for a in dir(diarization) if not a.startswith("_")]
+        raise RuntimeError(
+            f"Cannot extract Annotation from {type(diarization).__name__}. "
+            f"Available attributes: {attrs}"
+        )
     segments = [
         (turn.start, turn.end, speaker)
-        for turn, _, speaker in diarization.itertracks(yield_label=True)
+        for turn, _, speaker in annotation.itertracks(yield_label=True)
     ]
     n_speakers = len({s[2] for s in segments})
     print(f"      → {n_speakers} speaker(s), {len(segments)} raw segments detected")
@@ -330,7 +359,7 @@ Examples:
     # --- 2. Diarization ---
     t0 = time.time()
     raw_segments = run_diarization(
-        str(audio_path), args.hf_token,
+        audio, sr, args.hf_token,
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
     )
