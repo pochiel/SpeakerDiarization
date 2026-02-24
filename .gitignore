@@ -1,0 +1,19 @@
+# Speaker profiles (personal voice data — do not commit)
+profiles/
+
+# Environment / secrets
+.env
+
+# Audio files
+*.wav
+*.flac
+*.ogg
+*.mp3
+
+# Output transcripts
+*_transcript.json
+
+# Python
+__pycache__/
+*.pyc
+venv/

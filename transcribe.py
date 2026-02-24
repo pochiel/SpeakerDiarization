@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Speaker Diarization + Transcription System
-Phase 1: Basic transcription with speaker identification
+Phase 1 + 2: Transcription with speaker identification and profile matching
 
 Usage:
     python transcribe.py meeting.wav
@@ -30,6 +30,8 @@ import numpy as np
 import soundfile as sf
 from scipy.signal import resample_poly
 from dotenv import load_dotenv
+
+from profiles import SpeakerProfiles, parse_speaker_embeddings
 
 WHISPER_SR = 16000          # Whisper expects 16 kHz
 MIN_SEGMENT_DURATION = 0.5  # seconds — drop shorter segments
@@ -69,11 +71,13 @@ def run_diarization(
     hf_token: str,
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
-) -> list[tuple[float, float, str]]:
+) -> tuple[list[tuple[float, float, str]], dict[str, np.ndarray]]:
     """
     Run pyannote/speaker-diarization-3.1.
     Accepts preloaded audio (numpy array) to avoid torchcodec/FFmpeg dependency.
-    Returns list of (start_sec, end_sec, speaker_id).
+    Returns (segments, speaker_embeddings) where:
+      segments          : [(start_sec, end_sec, speaker_id), ...]
+      speaker_embeddings: {speaker_id: flat float32 ndarray}  (empty if unavailable)
     """
     import torch
     from pyannote.audio import Pipeline
@@ -96,32 +100,43 @@ def run_diarization(
     audio_input = {"waveform": waveform, "sample_rate": sr}
 
     print("      Running diarization (slowest step on CPU)...")
-    diarization = pipeline(audio_input, **params)
+    try:
+        from pyannote.audio.pipelines.utils.hook import ProgressHook
+        with ProgressHook() as hook:
+            output = pipeline(audio_input, hook=hook, **params)
+    except ImportError:
+        output = pipeline(audio_input, **params)
 
     # pyannote >= 3.3 returns DiarizeOutput; extract the Annotation object
     annotation = None
     for candidate in [
-        diarization,
-        getattr(diarization, "speaker_diarization", None),
-        getattr(diarization, "exclusive_speaker_diarization", None),
-        getattr(diarization, "annotation", None),
+        output,
+        getattr(output, "speaker_diarization", None),
+        getattr(output, "exclusive_speaker_diarization", None),
+        getattr(output, "annotation", None),
     ]:
         if candidate is not None and hasattr(candidate, "itertracks"):
             annotation = candidate
             break
     else:
-        attrs = [a for a in dir(diarization) if not a.startswith("_")]
+        attrs = [a for a in dir(output) if not a.startswith("_")]
         raise RuntimeError(
-            f"Cannot extract Annotation from {type(diarization).__name__}. "
+            f"Cannot extract Annotation from {type(output).__name__}. "
             f"Available attributes: {attrs}"
         )
+
     segments = [
         (turn.start, turn.end, speaker)
         for turn, _, speaker in annotation.itertracks(yield_label=True)
     ]
     n_speakers = len({s[2] for s in segments})
     print(f"      → {n_speakers} speaker(s), {len(segments)} raw segments detected")
-    return segments
+
+    # Extract speaker embeddings for Phase 2 profile matching / enrollment
+    raw_emb = getattr(output, "speaker_embeddings", None)
+    speaker_embeddings = parse_speaker_embeddings(raw_emb, labels=annotation.labels())
+
+    return segments, speaker_embeddings
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +323,24 @@ Examples:
         action="store_true",
         help="Suppress readable transcript output to stdout",
     )
+    parser.add_argument(
+        "--profile-dir",
+        default="profiles",
+        help="Speaker profile directory for auto-identification (default: profiles). "
+             "Skipped if directory is empty or does not exist.",
+    )
+    parser.add_argument(
+        "--enroll",
+        default="",
+        help="Enroll speakers after transcription: SPEAKER_00=田中,SPEAKER_01=鈴木. "
+             "Updates profiles with embeddings from this session.",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.65,
+        help="Cosine similarity threshold for profile matching (default: 0.65).",
+    )
     args = parser.parse_args()
 
     # --- Validate ---
@@ -358,7 +391,7 @@ Examples:
 
     # --- 2. Diarization ---
     t0 = time.time()
-    raw_segments = run_diarization(
+    raw_segments, speaker_embeddings = run_diarization(
         audio, sr, args.hf_token,
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
@@ -373,6 +406,21 @@ Examples:
     if not segments:
         print("ERROR: No speech segments found. Check your audio file.")
         sys.exit(1)
+
+    # --- Profile-based auto-identification (Phase 2) ---
+    profile_dir = Path(args.profile_dir)
+    if profile_dir.exists() and speaker_embeddings:
+        profiles = SpeakerProfiles(str(profile_dir))
+        profiles.load()
+        if len(profiles) > 0:
+            auto_names = profiles.match_speakers(speaker_embeddings, threshold=args.threshold)
+            identified = {k: v for k, v in auto_names.items() if v != k}
+            if identified:
+                print(f"      [Profile] Auto-identified: {identified}")
+            # --speaker-names takes precedence; profiles fill in the rest
+            for spk_id, name in auto_names.items():
+                if spk_id not in speaker_names:
+                    speaker_names[spk_id] = name
 
     # --- 3. Load Whisper model ---
     print(f"\n[3/4] Loading Whisper model ({args.model})...")
@@ -394,6 +442,28 @@ Examples:
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
+
+    # --- Enroll speakers from this session (Phase 2) ---
+    if args.enroll and speaker_embeddings:
+        enroll_map: dict[str, str] = {}
+        for pair in args.enroll.split(","):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                enroll_map[k.strip()] = v.strip()
+        if enroll_map:
+            profiles = SpeakerProfiles(str(profile_dir))
+            profiles.load()
+            enrolled = 0
+            for spk_id, name in enroll_map.items():
+                if spk_id in speaker_embeddings:
+                    profiles.enroll(name, speaker_embeddings[spk_id])
+                    n = profiles._meta[name]["n_samples"]
+                    print(f"      [Enroll] {spk_id} → {name}  (total samples: {n})")
+                    enrolled += 1
+                else:
+                    print(f"      [Enroll] WARNING: {spk_id} not found in embeddings")
+            if enrolled > 0:
+                profiles.save()
 
     # --- Summary ---
     total_time = time.time() - total_start
